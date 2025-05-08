@@ -10,7 +10,6 @@ import json
 
 # 设置设备
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"全局使用设备: {device}")
 
 class ExperienceBuffer:
     def __init__(self, capacity=10000):
@@ -55,8 +54,7 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
         agent.optimizer, 
         mode='max', 
         factor=0.5, 
-        patience=30, 
-        verbose=True
+        patience=30
     )
     
     agent.entropy_coef = 0.05 

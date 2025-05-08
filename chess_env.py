@@ -57,6 +57,10 @@ class ChineseChessEnv(gym.Env):
         self.width = self.board_size[1] * self.cell_size
         self.height = self.board_size[0] * self.cell_size
         
+        # 添加棋盘历史记录用于检测重复移动
+        self.board_history = []
+        self.max_history_length = 6 # 记录最近的6个局面
+        
     def _init_board(self):
         """初始化棋盘"""
         board = np.zeros(self.board_size, dtype=np.int32)
@@ -110,6 +114,7 @@ class ChineseChessEnv(gym.Env):
         self.board = self._init_board()
         self.current_player = 0
         self.done = False
+        self.board_history = [] # 清空历史记录
         return self.board.copy()
     
     def step(self, action):
@@ -135,15 +140,21 @@ class ChineseChessEnv(gym.Env):
         self.board[to_row][to_col] = piece
         self.board[from_row][from_col] = 0
         
+        # 将移动后的新局面添加到历史记录
+        self.board_history.append(self.board.copy())
+        # 保持历史记录长度不超过最大值
+        if len(self.board_history) > self.max_history_length:
+            self.board_history.pop(0) # 移除最旧的记录
+        
         # 计算移动后的局面价值
         post_value = self._evaluate_position()
         
         # 计算奖励
         reward = 0
         
-        # 1. 吃子奖励
+        # 1. 吃子奖励，后续可能需要加上所吃子的位置价值
         if captured_piece != 0:
-            reward += self._get_piece_value(captured_piece) * 0.1
+            reward += (self._get_piece_value(captured_piece) * 0.1 + self._get_position_value(captured_piece, to_row, to_col) * 0.1 + self._get_mobility_value(captured_piece, to_row, to_col) * 0.1)
         
         # 2. 局面改善奖励
         value_diff = post_value - pre_value
@@ -215,7 +226,11 @@ class ChineseChessEnv(gym.Env):
         elif piece == self.R_PAWN or piece == self.B_PAWN:
             return self._is_valid_pawn_move(from_row, from_col, to_row, to_col, piece)
         
-        return False
+        # 在验证合法性时，模拟移动并检查是否导致重复局面
+        if self._is_repeated_move_check(from_row, from_col, to_row, to_col):
+             return False # 如果是重复局面，视为非法移动
+
+        return True
     
     def _is_valid_king_move(self, from_row, from_col, to_row, to_col, piece):
         """检查将/帅的移动是否合法"""
@@ -390,7 +405,7 @@ class ChineseChessEnv(gym.Env):
             for col in range(9):
                 piece = self.board[row][col]
                 if piece != 0:
-                    # 基础子力价值
+                    # 基础棋子子力价值
                     piece_value = self._get_piece_value(piece)
                     
                     # 位置价值
@@ -400,7 +415,14 @@ class ChineseChessEnv(gym.Env):
                     mobility_value = self._get_mobility_value(piece, row, col)
                     
                     # 综合评估
-                    value += piece_value + position_value + mobility_value
+                    # 根据当前玩家区分敌我棋子价值
+                    if (self.current_player == 0 and 1 <= piece <= 7) or \
+                       (self.current_player == 1 and 8 <= piece <= 14):
+                        # 我方棋子，增加价值
+                        value += piece_value + position_value + mobility_value
+                    else:
+                        # 敌方棋子，减去价值
+                        value -= piece_value + position_value + mobility_value
         
         return value
     
@@ -467,10 +489,28 @@ class ChineseChessEnv(gym.Env):
                     valid_moves += 1
         return valid_moves * 0.1
     
-    def _is_repeated_move(self, from_row, from_col, to_row, to_col):
-        """检查是否重复移动"""
-        # 这里可以添加更复杂的重复移动检测逻辑
+    def _is_repeated_move_check(self, from_row, from_col, to_row, to_col):
+        """模拟移动并检查是否导致重复局面"""
+        # 创建当前棋盘的副本
+        temp_board = self.board.copy()
+
+        # 模拟执行移动
+        piece = temp_board[from_row][from_col]
+        temp_board[to_row][to_col] = piece
+        temp_board[from_row][from_col] = self.EMPTY
+
+        # 检查模拟后的局面是否在历史记录中
+        for history_board in self.board_history:
+            if np.array_equal(temp_board, history_board):
+                return True # 发现重复局面
+
         return False
+
+    def _is_repeated_move(self, from_row, from_col, to_row, to_col):
+        """检查是否重复移动 (旧方法，现在主要用于奖励计算，但逻辑上已经被 _is_valid_move 中的 _is_repeated_move_check 覆盖)"""
+        # 这个方法现在主要用于 step 函数中的奖励计算，实际上非法重复移动已经在 _is_valid_move 中被阻止了
+        # 为了保持原代码结构，这里简单返回 _is_repeated_move_check 的结果
+        return self._is_repeated_move_check(from_row, from_col, to_row, to_col)
     
     def render(self, mode='human'):
         """渲染当前棋盘状态"""
@@ -563,9 +603,10 @@ class ChineseChessEnv(gym.Env):
             self.screen = None
 
     def _is_check(self):
-        """检查当前玩家是否被将军"""
-        # 找到当前玩家的将/帅位置
-        king_piece = self.R_KING if self.current_player == 0 else self.B_KING
+        """检查当前玩家是否将军了对方"""
+        # 找到对方玩家的将/帅位置
+        opponent_player = 1 - self.current_player
+        king_piece = self.R_KING if opponent_player == 0 else self.B_KING
         king_pos = None
         for row in range(10):
             for col in range(9):
@@ -574,20 +615,27 @@ class ChineseChessEnv(gym.Env):
                     break
             if king_pos:
                 break
-        
+
         if not king_pos:
-            return False
-        
-        # 检查对方所有棋子是否可以吃掉将/帅
-        opponent_pieces = range(8, 15) if self.current_player == 0 else range(1, 8)
+            return False # 对方王不存在，不可能将军
+
+        # 检查当前玩家（刚刚移动的玩家）所有棋子是否可以吃掉对方的将/帅
+        current_player_pieces = range(1, 8) if self.current_player == 0 else range(8, 15)
         for row in range(10):
             for col in range(9):
                 piece = self.board[row][col]
-                if piece in opponent_pieces:
-                    if self._is_valid_move(row, col, king_pos[0], king_pos[1]):
-                        return True
-        
-        return False
+                if piece in current_player_pieces:
+                    # 检查当前玩家的棋子是否可以移动到对方王的位置
+                    # 这里调用 _is_valid_move 并临时切换玩家视角，以利用已有的合法移动逻辑进行攻击判定
+                    original_current_player = self.current_player # 保存当前玩家
+                    self.current_player = self.current_player # 保持为当前玩家，检查其棋子能否攻击
+                    can_attack_king = self._is_valid_move(row, col, king_pos[0], king_pos[1])
+                    self.current_player = original_current_player # 恢复玩家视角
+
+                    if can_attack_king:
+                        return True # 发现可以攻击对方王，即将军了对方
+
+        return False # 没有棋子可以攻击对方王
 
     def _is_checkmate(self):
         """检查当前玩家是否被将死"""
@@ -621,8 +669,39 @@ class ChineseChessEnv(gym.Env):
         return True
 
     def _is_checked(self):
-        """检查当前玩家是否被将军（用于奖励计算）"""
-        return self._is_check()
+        """检查当前玩家是否被将军"""
+        # 找到当前玩家的将/帅位置
+        king_piece = self.R_KING if self.current_player == 0 else self.B_KING
+        king_pos = None
+        for row in range(10):
+            for col in range(9):
+                if self.board[row][col] == king_piece:
+                    king_pos = (row, col)
+                    break
+            if king_pos:
+                break
+
+        if not king_pos:
+            return False # 当前玩家的王不存在，不可能被将军
+
+        # 检查对方所有棋子是否可以攻击到当前玩家的将/帅
+        opponent_pieces = range(8, 15) if self.current_player == 0 else range(1, 8)
+        for row in range(10):
+            for col in range(9):
+                piece = self.board[row][col]
+                if piece in opponent_pieces:
+                     # 检查对方的棋子是否可以移动到当前玩家王的位置
+                     # 这里需要调用 _is_valid_move，并临时切换玩家视角来模拟对方的攻击
+                    original_current_player = self.current_player # 保存当前玩家
+                    # 暂时切换到对方玩家的视角，以便 _is_valid_move 检查对方棋子的合法移动
+                    self.current_player = 1 - original_current_player
+                    can_attack_king = self._is_valid_move(row, col, king_pos[0], king_pos[1])
+                    self.current_player = original_current_player # 恢复玩家视角
+
+                    if can_attack_king:
+                        return True # 发现对方棋子可以攻击当前玩家的王，即被将军
+
+        return False # 没有对方棋子可以攻击当前玩家的王
 
     def _is_game_over(self):
         """检查游戏是否结束"""
