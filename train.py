@@ -26,7 +26,7 @@ class ExperienceBuffer:
     def __len__(self):
         return len(self.buffer)
 
-def train(env, agent, n_episodes=20000, max_steps=200, save_interval=100, batch_size=256, run_name_prefix="run"):
+def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_size=256, run_name_prefix="run"):
     """训练函数"""
     # 创建本次运行的唯一目录
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -153,10 +153,13 @@ class ChessPPO:
         old_log_probs_batch = torch.FloatTensor(old_log_probs_batch).to(self.device)
         rewards = torch.clamp(torch.FloatTensor(rewards).to(self.device), -10.0, 10.0)
         dones = torch.FloatTensor(dones).to(self.device)
-        
         # 防止奖励值过大
         rewards = torch.clamp(rewards, -10.0, 10.0)
-        
+
+        # 修复：确保 action_masks_batch 是 tensor 并在正确的 device 上
+        if action_masks_batch is not None and not torch.is_tensor(action_masks_batch):
+            action_masks_batch = torch.FloatTensor(action_masks_batch).to(self.device)
+
         # 计算当前策略的动作概率和状态价值
         if action_masks_batch is None:
             # 如果没有提供遮罩，创建一个只允许已选动作的遮罩
@@ -296,4 +299,4 @@ class ChessPPO:
         return {
             'policy_loss': policy_loss.item(), 'value_loss': value_loss.item(), 'entropy': entropy.item(),
             'kl_div': kl_div, 'epsilon': self.epsilon
-        } 
+        }
