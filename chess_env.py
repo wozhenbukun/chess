@@ -181,10 +181,16 @@ class ChineseChessEnv(gym.Env):
         # 更新状态
         self.board = self._get_state()
         
+        # 获取下一个状态
+        self.next_state = self.board.copy()
+
         # 检查游戏是否结束
         self.done = self._is_game_over()
-        
-        return self.board.copy(), reward, self.done, {}
+
+        # 切换玩家 (0 -> 1, 1 -> 0)
+        self.current_player = 1 - self.current_player
+
+        return self.next_state, reward, self.done, {}
     
     def _is_valid_move(self, from_row, from_col, to_row, to_col):
         """检查移动是否合法"""
@@ -639,7 +645,7 @@ class ChineseChessEnv(gym.Env):
 
     def _is_checkmate(self):
         """检查当前玩家是否被将死"""
-        if not self._is_check():
+        if not self._is_checked():
             return False
         
         # 尝试所有可能的移动
@@ -657,13 +663,13 @@ class ChineseChessEnv(gym.Env):
                                 self.board[from_row][from_col] = 0
                                 
                                 # 检查移动后是否仍被将军
-                                still_check = self._is_check()
+                                still_checked = self._is_checked()
                                 
                                 # 恢复棋盘
                                 self.board[from_row][from_col] = piece
                                 self.board[to_row][to_col] = original_piece
                                 
-                                if not still_check:
+                                if not still_checked:
                                     return False
         
         return True
