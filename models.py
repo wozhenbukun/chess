@@ -74,8 +74,14 @@ class ChessNet(nn.Module):
             if not torch.is_tensor(players):
                 players = torch.LongTensor(players).to(self.device)
             # 将玩家 ID (0 或 1) 扩展为与棋盘状态相同空间大小的通道
-            # 例如：红方(0) 通道全0，黑方(1) 通道全1
-            player_channel = players.unsqueeze(-1).unsqueeze(-1).expand(x.size(0), 1, x.size(2), x.size(3)).float()
+            # 创建一个全零或全一张量，形状为 (batch_size, 1, 10, 9)
+            batch_size = x.size(0)
+            player_channel = torch.zeros(batch_size, 1, 10, 9, device=self.device, dtype=torch.float32)
+            # 根据 players 的值填充 player_channel
+            # players 是 (batch_size,) 形状
+            for i in range(batch_size):
+                 player_channel[i, 0, :, :] = players[i].float() # 将玩家ID广播到整个10x9切片
+
             # 将玩家通道与棋盘状态通道拼接
             x = torch.cat((x, player_channel), dim=1)
         
@@ -298,3 +304,29 @@ class ChessPPO:
             'policy_loss': policy_loss.item(), 'value_loss': value_loss.item(), 'entropy': entropy.item(),
             'kl_div': kl_div, 'epsilon': self.epsilon
         }
+
+    def select_action(self, state, action_mask, player):
+        """根据当前状态、合法动作掩码和玩家选择动作（用于推理）"""
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        action_mask_tensor = torch.FloatTensor(action_mask).unsqueeze(0).to(self.device)
+        player_tensor = torch.LongTensor([player]).to(self.device)
+
+        with torch.no_grad():
+            # 调用模型 forward，传递玩家信息和 action_mask
+            action_log_probs, value = self.model(state_tensor, action_mask_tensor, players=player_tensor)
+
+        # 从对数概率中获取概率分布
+        action_probs = torch.exp(action_log_probs).squeeze(0) # 移除批次维度
+
+        # 应用合法动作掩码
+        action_probs = action_probs * action_mask_tensor.squeeze(0)
+
+        # 归一化概率分布（确保合法动作的概率之和为1）
+        action_probs = action_probs / (action_probs.sum() + 1e-9)
+
+        # 使用 Categorical 分布进行采样
+        dist = Categorical(action_probs)
+        action = dist.sample().item()
+
+        # 返回选择的动作
+        return action

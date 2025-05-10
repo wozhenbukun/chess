@@ -54,8 +54,9 @@ class ChineseChessEnv(gym.Env):
         # 用于渲染的变量
         self.screen = None
         self.cell_size = 60
-        self.width = self.board_size[1] * self.cell_size
-        self.height = self.board_size[0] * self.cell_size
+        # 修改窗口尺寸计算
+        self.width = (self.board_size[1] + 1) * self.cell_size # 9列 + 1个单元格边距
+        self.height = (self.board_size[0] + 1) * self.cell_size # 10行 + 1个单元格边距
         
         # 添加棋盘历史记录用于检测重复移动
         self.board_history = []
@@ -531,39 +532,50 @@ class ChineseChessEnv(gym.Env):
         # 填充背景
         self.screen.fill((255, 223, 128))  # 浅黄色背景
         
+        # 绘制偏移量
+        offset_x = self.cell_size // 2
+        offset_y = self.cell_size // 2
+
         # 绘制棋盘线条
         # 横线
         for row in range(10):
+            # 调整绘制坐标
             pygame.draw.line(self.screen, (0, 0, 0),
-                           (0, row * self.cell_size),
-                           (8 * self.cell_size, row * self.cell_size))
+                           (offset_x, offset_y + row * self.cell_size),
+                           (offset_x + 8 * self.cell_size, offset_y + row * self.cell_size))
         
         # 竖线
         for col in range(9):
             # 上半部分
+            # 调整绘制坐标
             pygame.draw.line(self.screen, (0, 0, 0),
-                           (col * self.cell_size, 0),
-                           (col * self.cell_size, 4 * self.cell_size))
+                           (offset_x + col * self.cell_size, offset_y),
+                           (offset_x + col * self.cell_size, offset_y + 4 * self.cell_size))
             # 下半部分
+            # 调整绘制坐标
             pygame.draw.line(self.screen, (0, 0, 0),
-                           (col * self.cell_size, 5 * self.cell_size),
-                           (col * self.cell_size, 9 * self.cell_size))
+                           (offset_x + col * self.cell_size, offset_y + 5 * self.cell_size),
+                           (offset_x + col * self.cell_size, offset_y + 9 * self.cell_size))
         
         # 绘制九宫格
         # 红方九宫
+        # 调整绘制坐标
         pygame.draw.line(self.screen, (0, 0, 0), 
-                        (3 * self.cell_size, 7 * self.cell_size), 
-                        (5 * self.cell_size, 9 * self.cell_size))
+                        (offset_x + 3 * self.cell_size, offset_y + 7 * self.cell_size), 
+                        (offset_x + 5 * self.cell_size, offset_y + 9 * self.cell_size))
+        # 调整绘制坐标
         pygame.draw.line(self.screen, (0, 0, 0), 
-                        (5 * self.cell_size, 7 * self.cell_size), 
-                        (3 * self.cell_size, 9 * self.cell_size))
+                        (offset_x + 5 * self.cell_size, offset_y + 7 * self.cell_size), 
+                        (offset_x + 3 * self.cell_size, offset_y + 9 * self.cell_size))
         # 黑方九宫
+        # 调整绘制坐标
         pygame.draw.line(self.screen, (0, 0, 0), 
-                        (3 * self.cell_size, 0 * self.cell_size), 
-                        (5 * self.cell_size, 2 * self.cell_size))
+                        (offset_x + 3 * self.cell_size, offset_y + 0 * self.cell_size), 
+                        (offset_x + 5 * self.cell_size, offset_y + 2 * self.cell_size))
+        # 调整绘制坐标
         pygame.draw.line(self.screen, (0, 0, 0), 
-                        (5 * self.cell_size, 0 * self.cell_size), 
-                        (3 * self.cell_size, 2 * self.cell_size))
+                        (offset_x + 5 * self.cell_size, offset_y + 0 * self.cell_size), 
+                        (offset_x + 3 * self.cell_size, offset_y + 2 * self.cell_size))
         
         # 绘制棋子
         for row in range(10):
@@ -572,11 +584,14 @@ class ChineseChessEnv(gym.Env):
                 if piece != self.EMPTY:
                     color = (255, 0, 0) if 1 <= piece <= 7 else (0, 0, 0)  # 红方红色，黑方黑色
                     # 在交叉点上绘制棋子
+                    # 调整绘制坐标
+                    center_x = offset_x + col * self.cell_size
+                    center_y = offset_y + row * self.cell_size
                     pygame.draw.circle(self.screen, color, 
-                                     (col * self.cell_size, row * self.cell_size), 
+                                     (center_x, center_y), 
                                      self.cell_size // 2 - 5)
                     pygame.draw.circle(self.screen, (255, 255, 200), 
-                                     (col * self.cell_size, row * self.cell_size), 
+                                     (center_x, center_y), 
                                      self.cell_size // 2 - 8)
                     
                     # 绘制棋子文字
@@ -591,7 +606,8 @@ class ChineseChessEnv(gym.Env):
                         self.R_PAWN: "兵", self.B_PAWN: "卒"
                     }
                     text = font.render(piece_names[piece], True, color)
-                    text_rect = text.get_rect(center=(col * self.cell_size, row * self.cell_size))
+                    # 调整绘制坐标
+                    text_rect = text.get_rect(center=(center_x, center_y))
                     self.screen.blit(text, text_rect)
         
         pygame.display.flip()

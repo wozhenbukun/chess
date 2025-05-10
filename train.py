@@ -179,12 +179,10 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
         players_ep_tensor = torch.LongTensor(np.array(players_ep)).to(device) # <-- 添加 players_ep_tensor
         with torch.no_grad():
             # 调用模型 forward，传递玩家信息
-            # 假设模型 forward 签名必须有 action_mask，这里使用一个 all True 的 mask
-            action_masks_ep_np = np.array(action_masks_ep)
-            all_true_mask = torch.ones_like(agent.model(states_ep_tensor, torch.FloatTensor(action_masks_ep_np).to(device), players=players_ep_tensor)[0]).bool() # <-- 传递 players 参数
-            _, values_ep_tensor = agent.model(states_ep_tensor, all_true_mask.float(), players=players_ep_tensor) # <-- 传递 players 参数
+            # 注意：在这里计算状态价值 V(s)，不需要 action_mask
+            _, values_ep_tensor = agent.model(states_ep_tensor, players=players_ep_tensor) # <-- 传递 players 参数
             values_ep = values_ep_tensor.squeeze(-1).cpu().numpy()
-        
+
         # 3. 计算最后一个状态的 V(s')
         # 最后一个状态的价值，如果 episode 是自然结束 (done)，则为 0
         # 如果是因为 max_steps 结束，则为模型预测的价值
@@ -192,11 +190,10 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
         last_state_ep_tensor = torch.FloatTensor(np.array(next_states_ep[-1])).unsqueeze(0).to(device)
         last_player_ep_tensor = torch.LongTensor([players_ep[-1]]).to(device) # <-- 添加 last_player_ep_tensor
         with torch.no_grad():
-            # 同样使用 all True mask 获取价值，并传递玩家信息
-            last_action_mask_ep_np = np.array(action_masks_ep[-1])
-            all_true_mask_last = torch.ones_like(agent.model(last_state_ep_tensor, torch.FloatTensor(last_action_mask_ep_np).unsqueeze(0).to(device), players=last_player_ep_tensor)[0]).bool() # <-- 传递 players 参数
-            _, last_value_ep_tensor = agent.model(last_state_ep_tensor, all_true_mask_last.float(), players=last_player_ep_tensor) # <-- 传递 players 参数
-        
+            # 计算最后一个状态的价值 V(s')
+            # 同样不需要 action_mask
+            _, last_value_ep_tensor = agent.model(last_state_ep_tensor, players=last_player_ep_tensor) # <-- 传递 players 参数
+
         last_value_ep = last_value_ep_tensor.squeeze(-1).item() if not dones_ep[-1] else 0.0
         
         # 4. 计算 GAE 和 Returns
