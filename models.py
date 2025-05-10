@@ -13,8 +13,8 @@ class ChessNet(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"使用设备: {self.device}")
         
-        # 输入形状为(10, 9)的棋盘状态
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+        # 输入形状为(10, 9)的棋盘状态 + 1个玩家通道 = 2个输入通道
+        self.conv1 = nn.Conv2d(2, 64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(64)
         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(128)
@@ -60,13 +60,24 @@ class ChessNet(nn.Module):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
     
-    def forward(self, x, action_mask=None):
+    def forward(self, x, action_mask=None, players=None):
         # 确保输入在正确的设备上
         x = x.to(self.device)
         
-        # 确保输入形状正确
+        # 确保输入形状正确 (batch_size, height, width) -> (batch_size, 1, height, width)
         if len(x.shape) == 3:
             x = x.unsqueeze(1)  # 添加通道维度
+        
+        # 创建玩家通道
+        if players is not None:
+            # 确保 players 是 tensor 并在正确设备上
+            if not torch.is_tensor(players):
+                players = torch.LongTensor(players).to(self.device)
+            # 将玩家 ID (0 或 1) 扩展为与棋盘状态相同空间大小的通道
+            # 例如：红方(0) 通道全0，黑方(1) 通道全1
+            player_channel = players.unsqueeze(-1).unsqueeze(-1).expand(x.size(0), 1, x.size(2), x.size(3)).float()
+            # 将玩家通道与棋盘状态通道拼接
+            x = torch.cat((x, player_channel), dim=1)
         
         # 卷积层
         x = F.relu(self.bn1(self.conv1(x)))
@@ -145,31 +156,31 @@ class ChessPPO:
         advantages_tensor = torch.clamp(advantages_tensor, -10.0, 10.0)
         return advantages_tensor
     
-    def update(self, states, actions, old_log_probs_batch, rewards, dones, action_masks_batch=None):
+    def update(self, states, actions, old_log_probs_batch, batch_returns, batch_advantages, action_masks_batch=None, batch_players=None):
         """更新策略和价值网络"""
         # 转换为张量并移动到正确的设备
         states = torch.FloatTensor(states).to(self.device)
         actions = torch.LongTensor(actions).to(self.device)
         old_log_probs_batch = torch.FloatTensor(old_log_probs_batch).to(self.device)
-        rewards = torch.clamp(torch.FloatTensor(rewards).to(self.device), -10.0, 10.0)
-        dones = torch.FloatTensor(dones).to(self.device)
-        # 防止奖励值过大
-        rewards = torch.clamp(rewards, -10.0, 10.0)
+        # 确保传入的 returns 和 advantages 是张量并在正确设备上
+        batch_returns = torch.FloatTensor(batch_returns).to(self.device)
+        batch_advantages = torch.FloatTensor(batch_advantages).to(self.device)
+        # 确保传入的 players 是张量并在正确设备上
+        if batch_players is not None:
+            batch_players = torch.LongTensor(batch_players).to(self.device)
 
         # 修复：确保 action_masks_batch 是 tensor 并在正确的 device 上
         if action_masks_batch is not None and not torch.is_tensor(action_masks_batch):
             action_masks_batch = torch.FloatTensor(action_masks_batch).to(self.device)
 
         # 计算当前策略的动作概率和状态价值
-        if action_masks_batch is None:
-            # 如果没有提供遮罩，创建一个只允许已选动作的遮罩
-            batch_size = states.size(0)
-            action_masks_batch = torch.zeros((batch_size, self.model.n_actions), device=self.device)
-            action_masks_batch.scatter_(1, actions.unsqueeze(1), 1)  # 只标记所选动作为合法
-        
-        # 获取当前策略的log概率和价值
+        # Note: 如果 ChessNet forward 需要 batch_players，这里需要修改调用
         try:
-            log_probs, values = self.model(states, action_masks_batch)
+            # 示例：如果模型 forward 改为 model(x, action_mask=None, players=None)
+            # log_probs, values = self.model(states, action_masks_batch, batch_players)
+            # 当前模型 forward 是 model(x, action_mask=None)
+            # 修复：调用模型时传递 batch_players
+            log_probs, values = self.model(states, action_mask=action_masks_batch, players=batch_players)
         except Exception as model_e:
             print(f"错误: 模型前向传播失败: {model_e}")
             # 如果模型调用失败，无法继续，返回0损失
@@ -178,21 +189,22 @@ class ChessPPO:
                 'kl_div': 0.0, 'epsilon': self.epsilon
             }
         
-        # 计算优势（raw advantages）
-        values = values.squeeze(-1)  # 确保是1D张量
-        next_value = torch.zeros(1, device=self.device)  # 假设最后一个状态的价值为0
-        advantages = self.compute_gae(rewards, values.detach(), next_value, dones)
+        # 计算优势（使用传入的 batch_advantages）
+        advantages = batch_advantages # 直接使用计算好的优势
         
-        # 计算returns，用于价值损失
-        returns = advantages + values.detach()
-        
-        # 归一化优势，用于策略损失，并裁剪极端值
+        # 归一化优势 (在计算GAE后对整个 episode 序列归一化更标准)
+        # 为了与原代码相似，保留这里的归一化，但应用于传入的 batch
         if len(advantages) > 1:
+            # 使用传入的batch_advantages进行归一化
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            # 裁剪极端值，减少方差
+            # 裁剪极端值
             advantages = torch.clamp(advantages, -5.0, 5.0)
         
+        # 计算returns，用于价值损失 (使用传入的 batch_returns)
+        returns = batch_returns # 直接使用计算好的回报
+        
         # 使用对数概率计算比率（更稳定）
+        values = values.squeeze(-1)  # 确保是1D张量
         new_log_probs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
         
         # 限制新旧概率的差距，防止KL散度过大
@@ -203,12 +215,12 @@ class ChessPPO:
         # 裁剪比率，防止过大更新
         ratio_clipped = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)
         
-        # 计算裁剪的策略损失
+        # 计算裁剪的策略损失，使用传入的 batch_advantages (现在是 advantages 变量)
         surr1 = ratio * advantages
         surr2 = ratio_clipped * advantages
         policy_loss = -torch.min(surr1, surr2).mean()
         
-        # 计算价值损失，使用returns
+        # 计算价值损失，使用传入的 batch_returns (现在是 returns 变量)
         value_loss = F.mse_loss(values, returns)
         
         # 安全计算熵
@@ -216,23 +228,10 @@ class ChessPPO:
         try:
             probs = torch.exp(log_probs) # log_probs shape: (batch_size, n_actions)
             if action_masks_batch is not None:
-                # 确保action_masks_batch是浮点型以便乘法
-                masked_probs = probs * action_masks_batch.float() 
+                masked_probs = probs * action_masks_batch.float()
             else:
                 masked_probs = probs
             
-            # 归一化概率
-            prob_sum = masked_probs.sum(dim=1, keepdim=True)
-            # 对 prob_sum 小于 epsilon 的行，其概率设为均匀分布（在有效动作上）或整体均匀
-            # 避免除以0或极小值导致 NaN
-            # uniform_probs = torch.ones_like(masked_probs) * (1.0 / self.model.n_actions)
-            # if action_masks_batch is not None:
-            #     num_legal_actions = action_masks_batch.sum(dim=1, keepdim=True)
-            #     uniform_probs = action_masks_batch.float() / torch.max(torch.tensor(1.0, device=self.device), num_legal_actions)
-                
-            # safe_probs = torch.where(prob_sum > 1e-8, masked_probs / (prob_sum + 1e-10), uniform_probs)
-            
-            # 更安全的归一化：如果和为0，则该行熵为0
             row_entropies_list = []
             for i in range(masked_probs.shape[0]):
                 row_prob_sum = masked_probs[i].sum()
@@ -245,7 +244,6 @@ class ChessPPO:
                     dist = Categorical(probs=normalized_row_probs)
                     row_entropies_list.append(dist.entropy())
                 else:
-                    # 如果所有动作概率和接近0 (例如所有动作都被mask或原始概率极小)
                     row_entropies_list.append(torch.tensor(0.0, device=self.device))
             
             if len(row_entropies_list) > 0:
