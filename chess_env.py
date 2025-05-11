@@ -237,6 +237,15 @@ class ChineseChessEnv(gym.Env):
         if self._is_repeated_move_check(from_row, from_col, to_row, to_col):
              return False # 如果是重复局面，视为非法移动
 
+        # 模拟移动，检查是否会导致将帅照面
+        temp_board = self.board.copy()
+        piece = temp_board[from_row][from_col]
+        temp_board[to_row][to_col] = piece
+        temp_board[from_row][from_col] = self.EMPTY
+
+        if self._is_kings_facing(temp_board):
+            return False # 如果移动后将帅照面，视为非法移动
+
         return True
     
     def _is_valid_king_move(self, from_row, from_col, to_row, to_col, piece):
@@ -770,6 +779,41 @@ class ChineseChessEnv(gym.Env):
                                 action_mask[action] = True
         
         return valid_actions, action_mask
+
+    def _is_kings_facing(self, board):
+        """检查当前棋盘局面下将帅是否直接照面"""
+        red_king_pos = None
+        black_king_pos = None
+
+        # 找到将帅位置
+        for row in range(10):
+            for col in range(9):
+                if board[row, col] == self.R_KING:
+                    red_king_pos = (row, col)
+                elif board[row, col] == self.B_KING:
+                    black_king_pos = (row, col)
+            if red_king_pos and black_king_pos:
+                break # 都找到了，可以退出循环
+
+        # 如果没有找到将或帅，则不可能照面（游戏应该已经结束了，但作为安全检查）
+        if not red_king_pos or not black_king_pos:
+            return False
+
+        # 检查是否在同一列
+        if red_king_pos[1] != black_king_pos[1]:
+            return False
+
+        # 检查之间是否有棋子
+        col = red_king_pos[1]
+        # 将帅总是一个在上面一个在下面，确定遍历的起始和结束行
+        start_row = min(red_king_pos[0], black_king_pos[0]) + 1
+        end_row = max(red_king_pos[0], black_king_pos[0])
+
+        for row in range(start_row, end_row):
+            if board[row, col] != self.EMPTY:
+                return False # 之间有棋子，不照面
+
+        return True # 在同一列且之间没有棋子，照面
 
 # 示例使用
 if __name__ == "__main__":
