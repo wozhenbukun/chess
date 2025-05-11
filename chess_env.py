@@ -372,15 +372,15 @@ class ChineseChessEnv(gym.Env):
             # 兵不能后退
             if to_row > from_row:
                 return False
-            # 兵未过河前只能前进
-            if from_row >= 5 and from_row != to_row:
+            # 兵未过河前不能平移
+            if from_row >= 5 and from_col != to_col:
                 return False
         else:  # 黑方卒
             # 卒不能后退
             if to_row < from_row:
                 return False
-            # 卒未过河前只能前进
-            if from_row <= 4 and from_row != to_row:
+            # 卒未过河前不能平移
+            if from_row <= 4 and from_col != to_col:
                 return False
         
         return True

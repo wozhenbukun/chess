@@ -159,7 +159,7 @@ class ChessPPO:
         
         advantages_tensor = torch.tensor(advantages, device=self.device, dtype=torch.float32)
         # 裁剪极端值，防止数值不稳定
-        advantages_tensor = torch.clamp(advantages_tensor, -10.0, 10.0)
+        advantages_tensor = torch.clamp(advantages_tensor, -10.0, 15.0)
         return advantages_tensor
     
     def update(self, states, actions, old_log_probs_batch, batch_returns, batch_advantages, action_masks_batch=None, batch_players=None):
