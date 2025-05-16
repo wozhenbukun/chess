@@ -184,7 +184,6 @@ class ChessPPO:
         try:
             # 示例：如果模型 forward 改为 model(x, action_mask=None, players=None)
             # log_probs, values = self.model(states, action_masks_batch, batch_players)
-            # 当前模型 forward 是 model(x, action_mask=None)
             # 修复：调用模型时传递 batch_players
             log_probs, values = self.model(states, action_mask=action_masks_batch, players=batch_players)
         except Exception as model_e:

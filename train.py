@@ -108,6 +108,10 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
         episode_experiences = [] # 临时存储当前episode的原始经验
         
         for step in range(max_steps):
+            #达到最大步数，打印当前步数
+            if step >= max_steps:
+                print(f"Episode {episode+1}: 达到最大步数 {max_steps}!")
+            
             valid_actions, action_mask = env.get_valid_actions()
             if not valid_actions:
                 # print(f"Episode {episode+1}: No valid actions found at step {step}!")
@@ -342,7 +346,7 @@ def main():
     agent = ChessPPO(model, lr=1e-4, entropy_coef=0.05) # lr 和 entropy_coef 和 train 里匹配
     
     try:
-        train(env, agent, n_episodes=20000, save_interval=100, batch_size=256)
+        train(env, agent, n_episodes=20000, save_interval=100, batch_size=16, max_steps=200)
     except KeyboardInterrupt:
         print("训练被用户中断。")
     finally:
