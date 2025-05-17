@@ -5,7 +5,7 @@ from chess_env import ChineseChessEnv
 from models import ChessNet, ChessPPO
 
 class ChessGame:
-    def __init__(self, model_path='runs\\run_20250510_235836\\best_model.pth'):
+    def __init__(self, model_path='D:\code\chess_online\chess\runs\run_20250517_153800\best_model.pth'):
         self.env = ChineseChessEnv()
 
         # 创建两个AI代理
@@ -116,7 +116,7 @@ class ChessGame:
 
 def main():
     # 可以通过修改这里加载不同的模型文件
-    game = ChessGame(model_path='runs\run_20250511_114257\best_model.pth') # 示例：加载之前训练的模型
+    game = ChessGame(model_path='D:\code\chess_online\chess\runs\run_20250517_153800\best_model.pth') # 示例：加载之前训练的模型
     # game = ChessGame() # 使用默认路径
     game.run()
 

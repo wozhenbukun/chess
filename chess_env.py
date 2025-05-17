@@ -62,6 +62,18 @@ class ChineseChessEnv(gym.Env):
         self.board_history = []
         self.max_history_length = 6 # 记录最近的6个局面
         
+        # 添加步数计数器
+        self.steps_this_episode = 0
+        
+        # 修改奖励参数
+        self.base_win_reward = 10.0     # 降低基础赢棋奖励
+        self.base_loss_penalty = -10.0   # 保持与赢棋奖励对称的负值
+        self.step_penalty = -0.05       # 保持每步的惩罚
+        self.survival_bonus = 0.02      # 保持生存奖励
+        self.decay_rate = 0.98          # 保持衰减率
+        self.quick_win_bonus = 5.0      # 保持快速获胜奖励
+        self.quick_win_threshold = 20   # 保持快速获胜的步数阈值
+        
     def _init_board(self):
         """初始化棋盘"""
         board = np.zeros(self.board_size, dtype=np.int32)
@@ -116,92 +128,139 @@ class ChineseChessEnv(gym.Env):
         self.current_player = 0
         self.done = False
         self.board_history = [] # 清空历史记录
+        self.steps_this_episode = 0 # 重置步数计数器
         return self.board.copy()
     
     def step(self, action):
         """执行一步动作"""
-        # --- 修改：处理整数动作编码或 UCI 招法字符串 ---
-        if isinstance(action, str): # 如果输入是字符串 (UCI 招法)
+        self.steps_this_episode += 1
+        
+        current_player_making_move = self.current_player # 行动方
+
+        if isinstance(action, str): 
             try:
                 from_row, from_col, to_row, to_col = self._parse_uci_move(action)
             except ValueError:
-                print(f"非法 UCI 招法: {action}")
-                return self.board.copy(), -10, True, {"message": "非法 UCI 招法"} # 非法招法给予惩罚并结束游戏
-        else: # 如果输入是整数动作编码
-             # 解析动作
+                # 对于UCI非法招法，直接判负并结束
+                return self.board.copy(), self.base_loss_penalty, True, {"message": "非法 UCI 招法"}
+        else: 
             from_row = action // (9 * 10 * 9)
             from_col = (action % (9 * 10 * 9)) // (10 * 9)
             to_row = (action % (10 * 9)) // 9
             to_col = action % 9
-        # --- 修改结束 ---
         
-        # 检查移动是否合法
+        # _is_valid_move 现在已包含自将军检查
         if not self._is_valid_move(from_row, from_col, to_row, to_col):
-            return self.board.copy(), -10, True, {"message": "非法移动"}  # 非法移动给予惩罚并结束游戏
+            # 理论上，如果agent从get_valid_actions()选择，不应到这里
+            # 但如果发生了，判当前行动方负
+            return self.board.copy(), self.base_loss_penalty, True, {"message": "环境判定为非法移动"}
         
-        # 执行移动
-        piece = self.board[from_row][from_col]
-        captured_piece = self.board[to_row][to_col]
+        # --- 执行移动并计算中间奖励 --- 
+        piece_moved = self.board[from_row][from_col]
+        captured_piece = self.board[to_row][to_col] # 记录被吃掉的棋子
+        pre_value = self._evaluate_position() # 移动前局面评估 (基于 current_player_making_move)
+
+        self.board[to_row][to_col] = piece_moved
+        self.board[from_row][from_col] = self.EMPTY
         
-        # 计算移动前的局面价值
-        pre_value = self._evaluate_position()
-        
-        # 执行移动
-        self.board[to_row][to_col] = piece
-        self.board[from_row][from_col] = 0
-        
-        # 将移动后的新局面添加到历史记录
         self.board_history.append(self.board.copy())
-        # 保持历史记录长度不超过最大值
         if len(self.board_history) > self.max_history_length:
-            self.board_history.pop(0) # 移除最旧的记录
+            self.board_history.pop(0)
         
-        # 计算移动后的局面价值
-        post_value = self._evaluate_position()
+        post_value = self._evaluate_position() # 移动后局面评估 (基于 current_player_making_move)
+
+        # 计算中间奖励 (在确定最终结局前)
+        intermediate_reward = 0
+        if captured_piece != 0 and captured_piece not in [self.R_KING, self.B_KING]: # 非王棋子被吃
+            intermediate_reward += (self._get_piece_value(captured_piece) * 0.1 + 
+                                    self._get_position_value(captured_piece, to_row, to_col) * 0.1 + 
+                                    self._get_mobility_value(captured_piece, to_row, to_col) * 0.1) # Passed to_row and to_col
         
-        # 计算奖励
-        reward = 0
-        
-        # 1. 吃子奖励，后续可能需要加上所吃子的位置价值
-        if captured_piece != 0:
-            reward += (self._get_piece_value(captured_piece) * 0.1 + self._get_position_value(captured_piece, to_row, to_col) * 0.1 + self._get_mobility_value(captured_piece, to_row, to_col) * 0.1)
-        
-        # 2. 局面改善奖励
-        value_diff = post_value - pre_value
-        reward += value_diff * 0.05
-        
-        # 3. 特殊奖励
-        # 将军奖励
-        if self._is_check():
-            reward += 0.5
-        
-        # 将死奖励
-        if self._is_checkmate():
-            reward += 10.0
-        
-        # 4. 惩罚项
-        # 重复移动惩罚
-        # 注意：重复移动已经在 _is_valid_move 中被阻止，这里主要用于奖励计算（尽管实际不会发生）
+        intermediate_reward += (post_value - pre_value) * 0.05 # 局面改善
+
+        # 检查行动方是否将军了对方
+        original_player_context_for_check = self.current_player # P_act
+        self.current_player = 1 - original_player_context_for_check # P_next
+        opponent_now_in_check = self._is_checked() # P_next 是否被 P_act 将军？
+        self.current_player = original_player_context_for_check # 恢复
+        if opponent_now_in_check:
+            intermediate_reward += 0.5
+
         if self._is_repeated_move(from_row, from_col, to_row, to_col):
-            reward -= 0.2
+            intermediate_reward -= 0.2
+            
+        intermediate_reward += self.step_penalty
+        intermediate_reward += self.survival_bonus
         
-        # 被将军惩罚
-        if self._is_checked():
-            reward -= 0.3
+        # --- 确定游戏结局并设置最终奖励 --- 
+        self.done = False
+        final_reward = intermediate_reward # 默认是中间奖励，如果游戏结束则覆盖
+
+        acting_player = self.current_player # 执行当前 step 的玩家
+        opponent_player = 1 - acting_player # 对方
+
+        # 检查当前行动方是否导致游戏结束（通过将死对方、吃掉对方王、或逼和对方）
+
+        # 1. 检查是否吃掉对方的王 (acting_player 获胜)
+        opponent_king_piece = self.R_KING if opponent_player == 0 else self.B_KING
+        opponent_king_exists = any(opponent_king_piece in row for row in self.board)
+
+        if not opponent_king_exists: # 行动方吃掉了对方的王，行动方获胜
+            self.done = True
+            if self.steps_this_episode <= self.quick_win_threshold:
+                final_reward = self.base_win_reward + self.quick_win_bonus
+            else:
+                final_reward = self.base_win_reward * (self.decay_rate ** (self.steps_this_episode - self.quick_win_threshold))
+            print(f"DEBUG_ENV (ep_steps: {self.steps_this_episode}): Player {acting_player} WON by KING CAPTURE. Final Reward: {final_reward:.2f}, Done: {self.done}")
+            
+            # 游戏结束，切换到下一个玩家（输家），但这次切换是为了环境的下一个 reset 做准备
+            self.current_player = opponent_player
+            return self.board.copy(), final_reward, self.done, {}
+
+        # 2. 检查行动方是否将死或逼和对方
+        # 临时切换到对方视角，检查其是否被将死或逼和
+        original_current_player = self.current_player # 保存当前玩家（行动方）
+        self.current_player = opponent_player       # 切换到对方视角
+
+        opponent_is_checkmated = self._is_checkmate() # 检查对方是否被将死
+        # 检查对方是否被将军 (用于逼和判断)
+        opponent_is_in_check = self._is_checked()
+        # 获取对方的合法走法
+        opponent_valid_actions, _ = self.get_valid_actions()
+        opponent_has_no_valid_moves = not opponent_valid_actions
         
-        # 更新状态
-        self.board = self._get_state()
+        # 恢复回行动方视角，因为下面的奖励和 done 是针对行动方的
+        self.current_player = original_current_player
+
+        if opponent_is_checkmated: # 行动方通过将死对方获胜
+            self.done = True
+            if self.steps_this_episode <= self.quick_win_threshold:
+                final_reward = self.base_win_reward + self.quick_win_bonus
+            else:
+                final_reward = self.base_win_reward * (self.decay_rate ** (self.steps_this_episode - self.quick_win_threshold))
+            print(f"DEBUG_ENV (ep_steps: {self.steps_this_episode}): Player {acting_player} WON by CHECKMATE. Final Reward: {final_reward:.2f}, Done: {self.done}")
+            
+            # 游戏结束，切换到下一个玩家（输家）
+            self.current_player = opponent_player
+            return self.board.copy(), final_reward, self.done, {}
+
+        elif opponent_has_no_valid_moves and not opponent_is_in_check: # 行动方造成对方棋逼和 (Stalemate)
+            self.done = True
+            final_reward = 0.0 # 和棋奖励为0
+            print(f"DEBUG_ENV (ep_steps: {self.steps_this_episode}): Game is a DRAW by STALEMATE (Opponent {opponent_player} has no moves). Final Reward: {final_reward:.2f}, Done: {self.done}")
+            
+            # 游戏结束，切换到下一个玩家
+            self.current_player = opponent_player
+            return self.board.copy(), final_reward, self.done, {}
         
-        # 获取下一个状态
-        self.next_state = self.board.copy()
+        # else: 游戏未结束或未明确分出胜负（例如长将、长捉等复杂规则未实现，目前视为游戏未结束）
 
-        # 检查游戏是否结束
-        self.done = self._is_game_over()
+        # 如果游戏未结束，则 current_player 已经是下一个玩家了（在上面的临时切换后没有恢复，这是个错误）
+        # 修正：如果游戏没有结束，current_player 应该切换到对手
+        self.current_player = opponent_player # 切换到下一个行动方
 
-        # 切换玩家 (0 -> 1, 1 -> 0)
-        self.current_player = 1 - self.current_player
-
-        return self.next_state, reward, self.done, {}
+        # 如果游戏未结束，返回中间奖励和 done=False
+        return self.board.copy(), final_reward, self.done, {}
     
     def _is_valid_move(self, from_row, from_col, to_row, to_col):
         """检查移动是否合法"""
@@ -255,6 +314,24 @@ class ChineseChessEnv(gym.Env):
 
         if self._is_kings_facing(temp_board):
             return False # 如果移动后将帅照面，视为非法移动
+
+        # 检查移动是否会导致己方王被将军
+        # 保存原始棋盘状态和当前玩家（因为_is_checked会修改它们）
+        original_board_state = self.board.copy()
+        original_current_player = self.current_player
+
+        # 在临时棋盘上模拟走子
+        self.board = temp_board 
+        # _is_checked() 检查的是 self.current_player (当前行动方) 是否被将军
+        # 此时 self.current_player 仍然是正在尝试走棋的那一方
+        move_leaves_king_in_check = self._is_checked()
+        
+        # 恢复原始棋盘状态和玩家
+        self.board = original_board_state
+        self.current_player = original_current_player
+
+        if move_leaves_king_in_check:
+            return False # 如果移动导致己方王被将军，则为非法移动
 
         return True
     
@@ -952,36 +1029,23 @@ if __name__ == "__main__":
             from_row, from_col, to_row, to_col = env._parse_uci_move(uci_action)
             is_legal = env._is_valid_move(from_row, from_col, to_row, to_col)
             if is_legal:
-                 print(f"执行 UCI 招法: {uci_action}")
                  obs, reward, done, info = env.step(uci_action) # 现在 step 方法可以接受 UCI 字符串
             else:
-                 print(f"UCI 招法 {uci_action} 非法！")
                  # 如果非法，可以选择一个合法动作或者结束游戏
                  valid_actions, _ = env.get_valid_actions()
                  if valid_actions:
                       action = np.random.choice(valid_actions)
-                      print(f"执行随机合法动作: {action}")
                       obs, reward, done, info = env.step(action)
                  else:
-                      print("无合法动作，游戏结束。")
                       done = True
         except ValueError as e:
-            print(f"解析 UCI 招法出错: {e}")
             done = True # 解析出错也结束游戏
 
-
-        # if "message" not in info: # 检查 info 字典中是否有 message 键
-        #     print(f"Player: {'Red' if env.current_player == 0 else 'Black'}, Reward: {reward}")
-        #     env.render()
-        #     pygame.time.wait(500)  # 暂停0.5秒
-        
         # 简化测试，直接打印状态和奖励
         print(f"Player: {'Red' if env.current_player == 0 else 'Black'}, Reward: {reward}")
         env.render()
         pygame.time.wait(500)  # 暂停0.5秒
 
-
-    
     print("Game Over!")
     pygame.time.wait(3000)  # 游戏结束后等待3秒
     env.close()

@@ -164,20 +164,36 @@ class ChessPPO:
     
     def update(self, states, actions, old_log_probs_batch, batch_returns, batch_advantages, action_masks_batch=None, batch_players=None):
         """更新策略和价值网络"""
-        # 转换为张量并移动到正确的设备
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.LongTensor(actions).to(self.device)
-        old_log_probs_batch = torch.FloatTensor(old_log_probs_batch).to(self.device)
-        # 确保传入的 returns 和 advantages 是张量并在正确设备上
-        batch_returns = torch.FloatTensor(batch_returns).to(self.device)
-        batch_advantages = torch.FloatTensor(batch_advantages).to(self.device)
+        # 检查输入张量是否已经在正确的设备上
+        if not torch.is_tensor(states):
+            states = torch.FloatTensor(states)
+        if not torch.is_tensor(actions):
+            actions = torch.LongTensor(actions)
+        if not torch.is_tensor(old_log_probs_batch):
+            old_log_probs_batch = torch.FloatTensor(old_log_probs_batch)
+        if not torch.is_tensor(batch_returns):
+            batch_returns = torch.FloatTensor(batch_returns)
+        if not torch.is_tensor(batch_advantages):
+            batch_advantages = torch.FloatTensor(batch_advantages)
+        
+        # 确保所有张量都在正确的设备上
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        old_log_probs_batch = old_log_probs_batch.to(self.device)
+        batch_returns = batch_returns.to(self.device)
+        batch_advantages = batch_advantages.to(self.device)
+        
         # 确保传入的 players 是张量并在正确设备上
         if batch_players is not None:
-            batch_players = torch.LongTensor(batch_players).to(self.device)
+            if not torch.is_tensor(batch_players):
+                batch_players = torch.LongTensor(batch_players)
+            batch_players = batch_players.to(self.device)
 
         # 修复：确保 action_masks_batch 是 tensor 并在正确的 device 上
-        if action_masks_batch is not None and not torch.is_tensor(action_masks_batch):
-            action_masks_batch = torch.FloatTensor(action_masks_batch).to(self.device)
+        if action_masks_batch is not None:
+            if not torch.is_tensor(action_masks_batch):
+                action_masks_batch = torch.FloatTensor(action_masks_batch)
+            action_masks_batch = action_masks_batch.to(self.device)
 
         # 计算当前策略的动作概率和状态价值
         # Note: 如果 ChessNet forward 需要 batch_players，这里需要修改调用

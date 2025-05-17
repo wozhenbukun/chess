@@ -20,39 +20,58 @@ import time
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ExperienceBuffer:
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
-    
-    def add(self, state, action, old_log_prob, returns, advantage, action_mask, current_player):
-        # 将 numpy 数组转换为列表存储，避免内存问题，并在 sample 时再转换为 tensor/numpy
-        self.buffer.append((state.tolist() if isinstance(state, np.ndarray) else state,\
-                           action,\
-                           old_log_prob,\
-                           returns,\
-                           advantage,\
-                           action_mask.tolist() if isinstance(action_mask, np.ndarray) else action_mask,\
-                           current_player))
-    
+    def __init__(self, capacity=100000):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+        self.model_experiences = []  # 存储模型玩家的经验
+        self.engine_experiences = []  # 存储引擎玩家的经验
+
+    def add(self, state, action, old_log_prob, return_, advantage, action_mask, player):
+        # 确保存储的是 numpy 数组而不是 tensor
+        if torch.is_tensor(state):
+            state = state.cpu().numpy()
+        if torch.is_tensor(action_mask):
+            action_mask = action_mask.cpu().numpy()
+        
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, old_log_prob, return_, advantage, action_mask, player)
+        self.position = (self.position + 1) % self.capacity
+        
+        # 分别存储不同玩家的经验
+        if player == 0:  # 模型玩家
+            self.model_experiences.append(self.position - 1)
+        else:  # 引擎玩家
+            self.engine_experiences.append(self.position - 1)
+
     def sample(self, batch_size):
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        # 返回包含计算好的回报、优势和玩家信息的批次
-        batch = [self.buffer[i] for i in indices]
+        # 确保从两种经验中均衡采样
+        model_batch_size = batch_size // 2
+        engine_batch_size = batch_size - model_batch_size
+        
+        # 从模型经验中采样
+        model_indices = np.random.choice(
+            self.model_experiences,
+            size=min(model_batch_size, len(self.model_experiences)),
+            replace=False
+        ).astype(int)  # 转换为整数类型
+        
+        # 从引擎经验中采样
+        engine_indices = np.random.choice(
+            self.engine_experiences,
+            size=min(engine_batch_size, len(self.engine_experiences)),
+            replace=False
+        ).astype(int)  # 转换为整数类型
+        
+        # 合并采样结果
+        indices = np.concatenate([model_indices, engine_indices])
+        return [self.buffer[i] for i in indices]
 
-        # 解压批次数据，确保顺序和 add 时一致
-        states = np.array([x[0] for x in batch])
-        actions = np.array([x[1] for x in batch])
-        old_log_probs = np.array([x[2] for x in batch])
-        returns = np.array([x[3] for x in batch])
-        advantages = np.array([x[4] for x in batch])
-        action_masks = np.array([x[5] for x in batch])
-        players = np.array([x[6] for x in batch]) # 玩家信息
-
-        return states, actions, old_log_probs, returns, advantages, action_masks, players
-    
     def __len__(self):
         return len(self.buffer)
 
-def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_size=256, run_name_prefix="run", engine_play_prob=0.2): # 添加 engine_play_prob 参数
+def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_size=256, run_name_prefix="run", initial_engine_play_prob=0.0, final_engine_play_prob=0.3, engine_ramp_episodes=5000, model_experience_weight=1.0, engine_experience_weight=0.5):
     """训练函数"""
     # 创建本次运行的唯一目录
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -68,7 +87,7 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
     agent.model = agent.model.to(device)
     # agent.device = device # agent内部应该已经有device了，或者从model获取
 
-    buffer = ExperienceBuffer(capacity=50000)
+    buffer = ExperienceBuffer(capacity=100000)
     
     episode_rewards_deque = deque(maxlen=10) # 用于计算最近10个episode的平均奖励
     best_reward = float('-inf')
@@ -80,8 +99,10 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         agent.optimizer, 
         mode='max', 
-        factor=0.5, 
-        patience=30
+        factor=0.8,  # 从0.5改为0.8，使衰减更缓慢
+        patience=50,  # 从30改为50，增加等待时间
+        min_lr=1e-6,  # 添加最小学习率限制
+        verbose=True  # 添加verbose以显示学习率变化
     )
     
     agent.entropy_coef = 0.05 
@@ -103,8 +124,12 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
         "kl_divs": [],
         "exploration_epsilons": [],
         "ppo_clip_epsilons": [],
-        "learning_rates": []
+        "learning_rates": [],
+        "engine_play_probs": [],  # 添加引擎使用概率的记录
+        "loss": []  # 添加损失的记录
     }
+    
+    games_ended_by_max_steps = 0 # 新增: 统计达到max_steps的对局数量
     
     # --- 集成 Pikafish 引擎 ---
     engine_path = os.path.join(".", "Pikafish", "pikafish-bmi2.exe")
@@ -246,23 +271,32 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
     # 使用 try...finally 块确保无论是否发生错误都能关闭引擎
     try:
         for episode in range(n_episodes):
+            # 计算当前引擎使用概率
+            if episode < engine_ramp_episodes:
+                current_engine_play_prob = initial_engine_play_prob + (final_engine_play_prob - initial_engine_play_prob) * (episode / engine_ramp_episodes)
+            else:
+                current_engine_play_prob = final_engine_play_prob
+            
+            # 记录当前引擎使用概率
+            metrics_history["engine_play_probs"].append(current_engine_play_prob)
+
             # 随机决定本局中哪个玩家由 PPO 模型控制（0=红方,1=黑方）
             model_player = np.random.choice([0, 1])
             engine_player = 1 - model_player
-            print(f"Episode {episode+1}: PPO 控制 {'红方' if model_player==0 else '黑方'}, 引擎控制 {'黑方' if model_player==0 else '红方'}")
+            # print(f"Episode {episode+1}: PPO 控制 {'红方' if model_player==0 else '黑方'}, 引擎控制 {'黑方' if model_player==0 else '红方'}")
 
             state = env.reset()
             current_episode_reward = 0
             episode_experiences = [] # 临时存储当前episode的原始经验
+            model_experiences = [] # 存储模型玩家的经验
+            engine_experiences = [] # 存储引擎玩家的经验
             
             for step in range(max_steps):
-                #达到最大步数，打印当前步数
                 if step >= max_steps:
                     print(f"Episode {episode+1}: 达到最大步数 {max_steps}!")
                 
                 valid_actions, action_mask = env.get_valid_actions()
                 if not valid_actions:
-                    # print(f"Episode {episode+1}: No valid actions found at step {step}!")
                     break
                 
                 # 判断当前回合由谁来走棋
@@ -298,23 +332,21 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
                                 old_log_prob_item = action_log_probs[0, action].item()
 
                     # 执行 PPO 动作
-                    next_state, reward, done, _ = env.step(action)
+                    next_state, reward, done, info = env.step(action)
 
-                    # 记录 PPO 经验
-                    episode_experiences.append((state.copy(), action, reward, next_state.copy(), done, old_log_prob_item, action_mask.copy(), model_player))
+                    # 记录 PPO 经验 - 保持原始奖励
+                    model_experiences.append((state.copy(), action, reward, next_state.copy(), done, old_log_prob_item, action_mask.copy(), model_player))
 
                 else:
                     # ------------ 引擎走棋 -------------
-                    if engine_proc is None:
-                        # 如果引擎不可用，使用随机动作
-                        print("引擎不可用，随机选择动作")
+                    if engine_proc is None or np.random.random() > current_engine_play_prob:
                         action = np.random.choice(valid_actions)
-                        next_state, reward, done, _ = env.step(action)
+                        next_state, reward, done, info = env.step(action)
                     else:
                         try:
                             fen_state = env.to_fen()
                             send_cmd(f'position fen {fen_state}')
-                            send_cmd('go movetime 1000') # 限制思考时间为1秒
+                            send_cmd('go movetime 1000')
                             lines = read_until('bestmove')
                             
                             action_uci = None
@@ -324,17 +356,16 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
                                     break
                                     
                             if action_uci is None or action_uci == '(none)':
-                                # print("引擎未返回合法招法，随机动作")
                                 action = np.random.choice(valid_actions)
-                                next_state, reward, done, _ = env.step(action)
+                                next_state, reward, done, info = env.step(action)
                             else:
-                                # print(f"引擎返回招法 (UCI): {action_uci}")
                                 try:
-                                    next_state, reward, done, _ = env.step(action_uci)
+                                    next_state, reward, done, info = env.step(action_uci)
+                                    # 将 UCI 招法转换为整数动作，以便记录到 buffer
+                                    action = env._uci_to_action(action_uci)
                                 except ValueError as ve:
-                                    # print(f"UCI招法解析失败: {ve}，随机动作")
                                     action = np.random.choice(valid_actions)
-                                    next_state, reward, done, _ = env.step(action)
+                                    next_state, reward, done, info = env.step(action)
                         except Exception as e:
                             print(f"引擎交互失败，随机动作: {e}")
                             
@@ -366,184 +397,217 @@ def train(env, agent, n_episodes=100, max_steps=200, save_interval=100, batch_si
                                     print(f"引擎重启失败: {restart_e}，将不再使用引擎")
                                     engine_proc = None
                             
-                            # 无论如何执行随机动作
                             action = np.random.choice(valid_actions)
-                            next_state, reward, done, _ = env.step(action)
+                            next_state, reward, done, info = env.step(action)
+                    
+                    # 记录引擎/随机动作的经验 - 保持原始奖励
+                    engine_experiences.append((state.copy(), action, reward, next_state.copy(), done, 0.0, action_mask.copy(), engine_player))
                 
-                # 更新 state 与累积奖励
+                # 更新 state 与累积奖励 - 只累积模型玩家的奖励
                 state = next_state
-                current_episode_reward += reward
+                if env.current_player == model_player:
+                    current_episode_reward += reward
                 
                 if done:
-                    break # Episode 结束
-            
-            # Episode 结束或达到max_steps，处理 episode 经验并添加到 buffer
-            # 需要从 episode_experiences 中提取信息并计算 GAE/Returns
-            
-            # 1. 从 episode_experiences 提取原始数据
-            if not episode_experiences:
-                # print("Episode experiences list is empty.")
-                continue # 如果 episode 没有任何经验，跳过
-            
-            # 提取所有在一个episode中的 state, action, reward, done, old_log_prob, action_mask, player
-            states_ep, actions_ep, rewards_ep, next_states_ep, dones_ep, old_log_probs_ep, action_masks_ep, players_ep = zip(*episode_experiences)
-            
-            # 2. 获取每个状态的价值 V(s)
-            # 将所有状态 tensor 化，一次通过模型获取价值，更高效
-            states_ep_tensor = torch.FloatTensor(np.array(states_ep)).to(device)
-            players_ep_tensor = torch.LongTensor(np.array(players_ep)).to(device) # <-- 添加 players_ep_tensor
-            with torch.no_grad():
-                # 调用模型 forward，传递玩家信息
-                # 注意：在这里计算状态价值 V(s)，不需要 action_mask
-                _, values_ep_tensor = agent.model(states_ep_tensor, players=players_ep_tensor) # <-- 传递 players 参数
-                values_ep = values_ep_tensor.squeeze(-1).cpu().numpy()
+                    break
 
-            # 3. 计算最后一个状态的 V(s')
-            # 最后一个状态的价值，如果 episode 是自然结束 (done)，则为 0
-            # 如果是因为 max_steps 结束，则为模型预测的价值
-            # 注意：next_states_ep 现在是 numpy 数组的元组，需要先转换为 numpy 数组再 tensor 化
-            last_state_ep_tensor = torch.FloatTensor(np.array(next_states_ep[-1])).unsqueeze(0).to(device)
-            last_player_ep_tensor = torch.LongTensor([players_ep[-1]]).to(device) # <-- 添加 last_player_ep_tensor
-            with torch.no_grad():
-                # 计算最后一个状态的价值 V(s')
-                # 同样不需要 action_mask
-                _, last_value_ep_tensor = agent.model(last_state_ep_tensor, players=last_player_ep_tensor) # <-- 传递 players 参数
+            # 检查是否因为达到max_steps而结束
+            if not done and step == max_steps - 1: # 如果是因为达到最大步数而结束
+                print(f"Episode {episode+1}: 达到最大步数 {max_steps}，视为和棋。")
+                done = True # 将 done 设置为 True
+                info['final_reward'] = 0.0 # 明确设置和棋奖励
+                # 可以在这里决定是否给双方经验一个小的奖励或惩罚
+                # 例如，将 model_experiences 和 engine_experiences 的最后一步奖励设为0
+                if model_experiences:
+                    last_model_exp = list(model_experiences[-1])
+                    last_model_exp[2] = 0.0 # reward
+                    model_experiences[-1] = tuple(last_model_exp)
+                if engine_experiences:
+                    last_engine_exp = list(engine_experiences[-1])
+                    last_engine_exp[2] = 0.0 # reward
+                    engine_experiences[-1] = tuple(last_engine_exp)
 
-            last_value_ep = last_value_ep_tensor.squeeze(-1).item() if not dones_ep[-1] else 0.0
+
+            # Determine final episode reward for logging
+            logged_episode_reward = 0.0
+            final_fen_for_debug = env.to_fen() # Get FEN for debugging
             
-            # 4. 计算 GAE 和 Returns
-            # compute_gae 需要 rewards, values, next_value, dones
-            # 注意：GAE计算是在一个连续序列上，这里episode_experiences就是连续的
-            advantages_ep_tensor = agent.compute_gae(list(rewards_ep), list(values_ep), last_value_ep, list(dones_ep)).cpu()
-            returns_ep_tensor = advantages_ep_tensor + torch.FloatTensor(values_ep) # 回报 = 优势 + 价值
+            if done: 
+                final_reward_from_env = info.get('final_reward', reward) # 这是模型玩家直接从环境获得的最终奖励
+
+                print(f"\n--- DEBUG: Episode {episode + 1} ENDED (done={done}) ---")
+                print(f"Final FEN: {final_fen_for_debug}")
+                print(f"Games ended by max_steps so far: {games_ended_by_max_steps}")
+                print(f"Episode model_player: {model_player}, engine_player: {engine_player}")
+                print(f"  Environment returned final_reward for model_player: {final_reward_from_env:.2f}")
+
+                # 确定获胜方和用于学习的经验
+                experiences_to_learn_from = []
+                rewards_for_learning = [] # 专门为学习调整的奖励
+                
+                if final_reward_from_env > 0: # 模型获胜
+                    logged_episode_reward = final_reward_from_env
+                    experiences_to_learn_from = model_experiences
+                    rewards_for_learning = [exp[2] for exp in model_experiences] # 使用模型原始奖励
+                    print(f"    => Model WON. Logged reward: {logged_episode_reward:.2f}. Learning from model_experiences.")
+                
+                elif final_reward_from_env < 0: # 引擎获胜 (模型输)
+                    logged_episode_reward = final_reward_from_env # 记录模型的负奖励
+                    experiences_to_learn_from = engine_experiences
+                    
+                    rewards_for_learning = []
+                    if engine_experiences:
+                        # 为引擎的获胜经验创建正向学习奖励
+                        # 最后一步奖励设为正，例如1.0，其余步骤设为小的正奖励或0
+                        num_engine_steps = len(engine_experiences)
+                        for i, exp in enumerate(engine_experiences):
+                            if i == num_engine_steps - 1:
+                                rewards_for_learning.append(1.0)  # 引擎获胜的最终学习奖励
+                            else:
+                                rewards_for_learning.append(0.01) # 引擎中间步骤的小学习奖励
+                    
+                    print(f"    => Engine WON. Model lost. Logged reward (model's): {logged_episode_reward:.2f}. Learning from engine_experiences with adjusted positive rewards.")
+
+                else: # 和棋
+                    logged_episode_reward = 0.0
+                    # 和棋时可以选择不学习，或者双方都学但奖励较低
+                    # 这里我们选择不从此局学习 (或者可以考虑双方经验都用，奖励为0)
+                    print(f"    => DRAW. Logged reward: {logged_episode_reward:.2f}. No experiences added for learning from this draw.")
+
+                # 如果有经验需要学习
+                if experiences_to_learn_from and rewards_for_learning:
+                    states_ep, actions_ep, _, next_states_ep, dones_ep, old_log_probs_ep, action_masks_ep, players_ep = zip(*experiences_to_learn_from)
+                    
+                    # 使用调整后的 rewards_for_learning
+                    current_rewards_ep = list(rewards_for_learning)
+                    
+                    # 确保 dones_ep 的最后一步是 True
+                    dones_ep_list = list(dones_ep)
+                    if not dones_ep_list[-1]:
+                        dones_ep_list[-1] = True
+                    
+                    states_ep_tensor = torch.FloatTensor(np.array(states_ep)).unsqueeze(1).to(device)
+                    # players_ep_tensor 需要根据当前学习的是谁的经验来设定
+                    # 如果学习模型经验，players_ep[0] 就是 model_player
+                    # 如果学习引擎经验，players_ep[0] 就是 engine_player
+                    learning_player_id = experiences_to_learn_from[0][7] # 获取该经验条目记录的玩家ID
+                    players_ep_tensor = torch.LongTensor(np.full_like(np.array(players_ep), learning_player_id)).to(device)
+
+
+                    with torch.no_grad():
+                        _, values_ep_tensor = agent.model(states_ep_tensor, players=players_ep_tensor)
+                        values_ep = values_ep_tensor.squeeze(-1).cpu().numpy()
+
+                    last_state_ep_tensor = torch.FloatTensor(np.array(next_states_ep[-1])).unsqueeze(0).unsqueeze(1).to(device)
+                    last_player_ep_tensor = torch.LongTensor([learning_player_id]).to(device) # 使用学习方的ID
+                    
+                    with torch.no_grad():
+                        _, last_value_ep_tensor = agent.model(last_state_ep_tensor, players=last_player_ep_tensor)
+                        # 如果最后一帧是done=True，则下一个状态的价值为0
+                        last_value_ep = last_value_ep_tensor.squeeze(-1).item() if not dones_ep_list[-1] else 0.0
+                    
+                    advantages_ep_tensor = agent.compute_gae(current_rewards_ep, list(values_ep), last_value_ep, dones_ep_list).cpu()
+                    returns_ep_tensor = advantages_ep_tensor + torch.FloatTensor(values_ep)
+                    
+                    advantages_ep = advantages_ep_tensor.numpy()
+                    returns_ep = returns_ep_tensor.numpy()
+
+                    for i in range(len(experiences_to_learn_from)):
+                        buffer.add(
+                            states_ep[i],
+                            actions_ep[i],
+                            old_log_probs_ep[i], # 对于引擎经验，这个可能是0，需要PPO能处理
+                            returns_ep[i],
+                            advantages_ep[i],
+                            action_masks_ep[i],
+                            learning_player_id # 存储的是执行该动作的玩家
+                        )
+                    print(f"    => Added {len(experiences_to_learn_from)} experiences from {'model' if learning_player_id == model_player else 'engine'} to buffer.")
+
+                print(f"--- END DEBUG EPISODE {episode + 1} ---\n")
             
-            advantages_ep = advantages_ep_tensor.numpy()
-            returns_ep = returns_ep_tensor.numpy()
+            episode_rewards_deque.append(logged_episode_reward) # Logged reward reflects model's performance
             
-            # 5. 将计算好的经验添加到 Buffer
-            # 优势归一化可以在这里或在 update 方法中进行
-            # 为了保持和原代码类似，先不在 buffer.add 前归一化优势
-            # 这里不再按玩家分离，直接将 episode 的所有经验（带计算好的GAE/Returns）添加到 buffer
-            # PPO update 将从 buffer 采样 mini-batch，这些 mini-batch 可能包含不同玩家的经验
-            
-            for i in range(len(episode_experiences)):
-                buffer.add(
-                    states_ep[i],
-                    actions_ep[i],
-                    old_log_probs_ep[i],
-                    returns_ep[i], # 使用计算好的回报
-                    advantages_ep[i], # 使用计算好的优势
-                    action_masks_ep[i],
-                    model_player  # 仅存储 PPO 玩家标识，简化 update 过滤
-                )
+            # 从经验池中采样并训练
+            if len(buffer) >= batch_size:
+                batch = buffer.sample(batch_size)
+                
+                # 解压批次数据
+                states = np.array([x[0] for x in batch])
+                actions = np.array([x[1] for x in batch])
+                old_log_probs = np.array([x[2] for x in batch])
+                returns = np.array([x[3] for x in batch])
+                advantages = np.array([x[4] for x in batch])
+                action_masks = np.array([x[5] for x in batch])
+                players = np.array([x[6] for x in batch])
+                
+                # 转换为tensor并添加玩家通道
+                states = torch.FloatTensor(states).unsqueeze(1).to(device)  # 添加通道维度
+                players_tensor = torch.LongTensor(players).to(device)
+                actions = torch.LongTensor(actions).to(device)
+                old_log_probs = torch.FloatTensor(old_log_probs).to(device)
+                returns = torch.FloatTensor(returns).to(device)
+                advantages = torch.FloatTensor(advantages).to(device)
+                action_masks = torch.FloatTensor(action_masks).to(device)
+                
+                # 更新策略
+                loss = agent.update(states, actions, old_log_probs, returns, advantages, action_masks, players_tensor)
+                metrics_history['loss'].append(loss)
             
             exploration_epsilon = max(epsilon_min, exploration_epsilon * epsilon_decay)
-            episode_rewards_deque.append(current_episode_reward) # 添加本episode的总原始奖励
             
-            # PPO 更新在 buffer 积累足够经验后进行
-            if len(buffer) >= batch_size:
-                avg_policy_loss_epoch = 0
-                avg_value_loss_epoch = 0
-                avg_entropy_epoch = 0
-                avg_kl_div_epoch = 0
-                avg_ppo_clip_epoch = 0
-                updates_done_in_episode = 0 # Note: This is per episode, should probably be total updates
+            avg_reward_print = np.mean(episode_rewards_deque) if len(episode_rewards_deque) > 0 else 0.0
+            
+            if (episode + 1) % 10 == 0:
+                print(f"Episode {episode + 1}, Avg Reward (raw): {avg_reward_print:.2f}, Exp Eps: {exploration_epsilon:.3f}, LR: {agent.optimizer.param_groups[0]['lr']:.6f}, Max Steps Hit: {games_ended_by_max_steps}")
                 
-                # PPO 更新可以进行多次 mini-batch
-                for _ in range(ppo_epochs):
-                    try:
-                        # 从buffer采样，现在包含计算好的returns和advantages
-                        batch_states, batch_actions, batch_old_log_probs, batch_returns, batch_advantages, batch_masks, batch_players = buffer.sample(batch_size)
-                        
-                        # 调用agent.update，并传递计算好的returns和advantages
-                        metrics = agent.update(
-                            batch_states,
-                            batch_actions,
-                            batch_old_log_probs,
-                            # 不再传递原始rewards和dones
-                            # 而是传递计算好的 returns 和 advantages
-                            batch_returns=batch_returns,
-                            batch_advantages=batch_advantages,
-                            action_masks_batch=batch_masks, # 继续传递 action_mask 给模型 forward
-                            # 将玩家信息传递给 update 方法，并在模型 forward 中使用
-                            batch_players=batch_players # 添加 batch_players 参数
-                        )
-                        # ... NaN handling and metrics accumulation ...
-                        if np.isnan(metrics['policy_loss']) or np.isnan(metrics['value_loss']):
-                            print(f"警告：更新{updates_done_in_episode+1}/{ppo_epochs} 产生NaN，跳过")
-                            consecutive_nan_count += 1
-                            if consecutive_nan_count >= max_nan_threshold:
-                                print("连续NaN过多，降低学习率")
-                                for param_group in agent.optimizer.param_groups:
-                                    param_group['lr'] = max(param_group['lr'] * 0.5, 1e-6) # 避免学习率过低
-                                consecutive_nan_count = 0
-                            continue
-                        
-                        updates_done_in_episode += 1
-                        consecutive_nan_count = 0
-                        
-                        avg_policy_loss_epoch += metrics['policy_loss']
-                        avg_value_loss_epoch += metrics['value_loss']
-                        avg_entropy_epoch += metrics['entropy']
-                        avg_kl_div_epoch += metrics['kl_div']
-                        avg_ppo_clip_epoch += metrics['epsilon'] # PPO的裁剪epsilon
-                    except Exception as e_update:
-                        print(f"PPO mini-batch 更新过程中出错: {e_update}")
-                        continue # 跳过此mini-batch的更新
+                # 记录指标
+                metrics_history["episodes"].append(episode + 1)
+                metrics_history["avg_rewards"].append(avg_reward_print)
                 
-                if updates_done_in_episode > 0:
-                    avg_policy_loss_epoch /= updates_done_in_episode
-                    avg_value_loss_epoch /= updates_done_in_episode
-                    avg_entropy_epoch /= updates_done_in_episode
-                    avg_kl_div_epoch /= updates_done_in_episode
-                    avg_ppo_clip_epoch /= updates_done_in_episode
+                # 只在有训练更新时记录loss相关指标
+                if len(buffer) >= batch_size:
+                    metrics_history["policy_losses"].append(loss['policy_loss'])
+                    metrics_history["value_losses"].append(loss['value_loss'])
+                    metrics_history["entropies"].append(loss['entropy'])
+                    metrics_history["kl_divs"].append(loss['kl_div'])
+                    print(f"  Losses: Policy: {loss['policy_loss']:.4f}, Value: {loss['value_loss']:.4f}, Entropy: {loss['entropy']:.4f}")
                 else:
-                    print("本轮PPO所有mini-batch更新均失败或跳过")
+                    # 如果没有训练更新，记录默认值
+                    metrics_history["policy_losses"].append(0.0)
+                    metrics_history["value_losses"].append(0.0)
+                    metrics_history["entropies"].append(0.0)
+                    metrics_history["kl_divs"].append(0.0)
                 
-                avg_reward_print = np.mean(episode_rewards_deque) if len(episode_rewards_deque) > 0 else 0.0
-                
-                if (episode + 1) % 10 == 0:
-                    print(f"Episode {episode + 1}, Avg Reward (raw): {avg_reward_print:.2f}, Exp Eps: {exploration_epsilon:.3f}, LR: {agent.optimizer.param_groups[0]['lr']:.6f}")
-                    if len(buffer) >= batch_size and updates_done_in_episode > 0:
-                        print(f"  Losses: Policy: {avg_policy_loss_epoch:.4f}, Value: {avg_value_loss_epoch:.4f}")
-                        print(f"  Metrics: Entropy: {avg_entropy_epoch:.4f}, KL: {avg_kl_div_epoch:.4f}, PPO Clip: {avg_ppo_clip_epoch:.3f}")
-                        
-                        # 记录指标
-                        metrics_history["episodes"].append(episode + 1)
-                        metrics_history["avg_rewards"].append(avg_reward_print)
-                        metrics_history["policy_losses"].append(avg_policy_loss_epoch)
-                        metrics_history["value_losses"].append(avg_value_loss_epoch)
-                        metrics_history["entropies"].append(avg_entropy_epoch)
-                        metrics_history["kl_divs"].append(avg_kl_div_epoch)
-                        metrics_history["exploration_epsilons"].append(exploration_epsilon)
-                        metrics_history["ppo_clip_epsilons"].append(avg_ppo_clip_epoch)
-                        metrics_history["learning_rates"].append(agent.optimizer.param_groups[0]['lr'])
+                metrics_history["exploration_epsilons"].append(exploration_epsilon)
+                metrics_history["ppo_clip_epsilons"].append(loss['epsilon'] if len(buffer) >= batch_size else 0.0)
+                metrics_history["learning_rates"].append(agent.optimizer.param_groups[0]['lr'])
 
-                    scheduler.step(avg_reward_print) # 使用原始奖励的平均值来调整学习率
-                    
-                    if avg_reward_print > best_reward:
-                        best_reward = avg_reward_print
-                        print(f"新最佳平均奖励: {best_reward:.2f}，保存模型到 {best_model_path}")
-                        torch.save({
-                            'model_state_dict': agent.model.state_dict(),
-                            'optimizer_state_dict': agent.optimizer.state_dict(),
-                            'episode': episode + 1,
-                            'best_reward': best_reward,
-                            'exploration_epsilon': exploration_epsilon
-                        }, best_model_path)
+                scheduler.step(avg_reward_print) # 使用原始奖励的平均值来调整学习率
                 
-                if (episode + 1) % save_interval == 0:
-                    print(f"定期保存最新模型到 {latest_model_path}")
+                if avg_reward_print > best_reward:
+                    best_reward = avg_reward_print
+                    print(f"新最佳平均奖励: {best_reward:.2f}，保存模型到 {best_model_path}")
                     torch.save({
                         'model_state_dict': agent.model.state_dict(),
                         'optimizer_state_dict': agent.optimizer.state_dict(),
                         'episode': episode + 1,
-                        'current_avg_reward': avg_reward_print,
+                        'best_reward': best_reward,
                         'exploration_epsilon': exploration_epsilon
-                    }, latest_model_path)
-                    # 同时保存一次metrics
-                    with open(metrics_path, 'w') as f:
-                        json.dump(metrics_history, f, indent=4)
+                    }, best_model_path)
+            
+            if (episode + 1) % save_interval == 0:
+                print(f"定期保存最新模型到 {latest_model_path}")
+                torch.save({
+                    'model_state_dict': agent.model.state_dict(),
+                    'optimizer_state_dict': agent.optimizer.state_dict(),
+                    'episode': episode + 1,
+                    'current_avg_reward': avg_reward_print,
+                    'exploration_epsilon': exploration_epsilon
+                }, latest_model_path)
+                # 同时保存一次metrics
+                with open(metrics_path, 'w') as f:
+                    json.dump(metrics_history, f, indent=4)
 
     finally:
         # 训练结束或发生异常时，关闭引擎
@@ -567,8 +631,20 @@ def main():
     agent = ChessPPO(model, lr=1e-4, entropy_coef=0.05) # lr 和 entropy_coef 和 train 里匹配
     
     try:
-        # 调整 engine_play_prob 参数来控制与引擎对弈的频率
-        train(env, agent, n_episodes=20000, save_interval=100, batch_size=16, max_steps=200, engine_play_prob=0.3) # 例如，30% 的步数由引擎决定
+        # 调整训练参数
+        train(
+            env, 
+            agent, 
+            n_episodes=200000, 
+            save_interval=100, 
+            batch_size=32,        # 增加batch_size以提高训练稳定性
+            max_steps=200,
+            initial_engine_play_prob=0,     # 初始不使用引擎
+            final_engine_play_prob=0.8,       # 降低最终引擎使用概率
+            engine_ramp_episodes=1000,        # 增加引擎使用概率的过渡期
+            model_experience_weight=1.0,
+            engine_experience_weight=0.5
+        )
     except KeyboardInterrupt:
         print("训练被用户中断。")
     finally:
