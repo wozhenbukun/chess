@@ -120,15 +120,24 @@ class ChineseChessEnv(gym.Env):
     
     def step(self, action):
         """执行一步动作"""
-        # 解析动作
-        from_row = action // (9 * 10 * 9)
-        from_col = (action % (9 * 10 * 9)) // (10 * 9)
-        to_row = (action % (10 * 9)) // 9
-        to_col = action % 9
+        # --- 修改：处理整数动作编码或 UCI 招法字符串 ---
+        if isinstance(action, str): # 如果输入是字符串 (UCI 招法)
+            try:
+                from_row, from_col, to_row, to_col = self._parse_uci_move(action)
+            except ValueError:
+                print(f"非法 UCI 招法: {action}")
+                return self.board.copy(), -10, True, {"message": "非法 UCI 招法"} # 非法招法给予惩罚并结束游戏
+        else: # 如果输入是整数动作编码
+             # 解析动作
+            from_row = action // (9 * 10 * 9)
+            from_col = (action % (9 * 10 * 9)) // (10 * 9)
+            to_row = (action % (10 * 9)) // 9
+            to_col = action % 9
+        # --- 修改结束 ---
         
         # 检查移动是否合法
         if not self._is_valid_move(from_row, from_col, to_row, to_col):
-            return self.board.copy(), -10, True, {}  # 非法移动给予惩罚
+            return self.board.copy(), -10, True, {"message": "非法移动"}  # 非法移动给予惩罚并结束游戏
         
         # 执行移动
         piece = self.board[from_row][from_col]
@@ -172,6 +181,7 @@ class ChineseChessEnv(gym.Env):
         
         # 4. 惩罚项
         # 重复移动惩罚
+        # 注意：重复移动已经在 _is_valid_move 中被阻止，这里主要用于奖励计算（尽管实际不会发生）
         if self._is_repeated_move(from_row, from_col, to_row, to_col):
             reward -= 0.2
         
@@ -815,6 +825,89 @@ class ChineseChessEnv(gym.Env):
 
         return True # 在同一列且之间没有棋子，照面
 
+    # --- 添加 FEN 转换和 UCI 招法处理 ---
+    def to_fen(self):
+        """将当前棋盘状态转换为中国象棋 FEN 字符串"""
+        fen = ""
+        piece_to_fen = {
+            self.R_CHARIOT: 'R', self.R_HORSE: 'N', self.R_ELEPHANT: 'B', self.R_ADVISOR: 'A',
+            self.R_KING: 'K', self.R_CANNON: 'C', self.R_PAWN: 'P',
+            self.B_CHARIOT: 'r', self.B_HORSE: 'n', self.B_ELEPHANT: 'b', self.B_ADVISOR: 'a',
+            self.B_KING: 'k', self.B_CANNON: 'c', self.B_PAWN: 'p'
+        }
+
+        for row in range(10):
+            empty_count = 0
+            for col in range(9):
+                piece = self.board[row, col]
+                if piece == self.EMPTY:
+                    empty_count += 1
+                else:
+                    if empty_count > 0:
+                        fen += str(empty_count)
+                        empty_count = 0
+                    fen_char = piece_to_fen.get(piece, '?')
+                    fen += fen_char
+            if empty_count > 0:
+                fen += str(empty_count)
+            if row < 9:
+                fen += '/'
+
+        # 添加当前玩家信息 ('w' for红方, 'b' for黑方)
+        fen += " " + ('w' if self.current_player == 0 else 'b')
+
+        # 检查FEN中是否有未知棋子
+        if '?' in fen:
+            print(f"警告：FEN 包含未知棋子: {fen}")
+
+        # 保持简化表示
+        fen += " - - 0 1"
+        return fen
+
+    def _parse_uci_move(self, uci_move):
+        """解析 UCI 格式的招法字符串"""
+        # 期望格式如 "a1a5"
+        if len(uci_move) != 4:
+            raise ValueError(f"非法 UCI 招法格式: {uci_move}")
+
+        # UCI 坐标到棋盘索引的映射 (例如 a1 对应 (9, 0) 在您的环境中)
+        # UCI 列 'a' -> 0, 'b' -> 1, ..., 'i' -> 8
+        # UCI 行 '1' -> 9, '2' -> 8, ..., '10' -> 0 (对于红方视角)
+        # 由于您的环境是固定索引 (0-9行, 0-8列)，我们需要根据 UCI 行号和列号转换为您的索引
+
+        # UCI 坐标到 (row, col) 的映射
+        def uci_to_coords(uci_str):
+            col_str = uci_str[0]
+            row_str = uci_str[1:]
+            
+            col = ord(col_str) - ord('a')
+            # 中国象棋的行号是从下面往上数，所以需要转换
+            # UCI 的行号 1-10 对应您的环境行索引 9-0
+            try:
+                row = 10 - int(row_str)
+            except ValueError:
+                 raise ValueError(f"非法 UCI 行号: {row_str}")
+
+            if not (0 <= row < 10 and 0 <= col < 9):
+                 raise ValueError(f"UCI 坐标超出棋盘范围: {uci_str}")
+
+            return row, col
+
+        from_coords_str = uci_move[:2]
+        to_coords_str = uci_move[2:]
+
+        from_row, from_col = uci_to_coords(from_coords_str)
+        to_row, to_col = uci_to_coords(to_coords_str)
+
+        return from_row, from_col, to_row, to_col
+
+    def _uci_to_action(self, uci_move):
+        """将 UCI 招法转换为环境的整数动作编码"""
+        from_row, from_col, to_row, to_col = self._parse_uci_move(uci_move)
+        action = from_row * 9 * 10 * 9 + from_col * 10 * 9 + to_row * 9 + to_col
+        return action
+    # --- 添加结束 ---
+
 # 示例使用
 if __name__ == "__main__":
     env = ChineseChessEnv()
@@ -824,15 +917,70 @@ if __name__ == "__main__":
     # 简单的随机走子示例
     done = False
     while not done:
-        # 随机选择一个动作
-        action = env.action_space.sample()
-        obs, reward, done, info = env.step(action)
+        # 随机选择一个动作 (现在也可以传递 UCI 字符串)
+        # action = env.action_space.sample() # 原来的整数动作
         
-        # 如果动作有效，则渲染
-        if "message" not in info:
-            print(f"Player: {'Red' if env.current_player == 0 else 'Black'}, Reward: {reward}")
-            env.render()
-            pygame.time.wait(500)  # 暂停0.5秒
+        # 示例：走一个 UCI 招法 (假设这是一个合法招法)
+        # 您需要根据当前局面确定合法的 UCI 招法来测试
+        # 例如，开局红方炮二平五 (c2e2)，在您的环境中是 (7, 1) -> (7, 4)
+        # 转换为 UCI 坐标：(7, 1) -> b3, (7, 4) -> e3 (从下往上数，10-row)
+        # 所以 UCI 招法是 b3e3
+        # 或者红方马二进三 (b1c3) -> (9,1) -> (7,2)
+        # 转换为 UCI 坐标：(9,1) -> b1, (7,2) -> c3
+        # 所以 UCI 招法是 b1c3
+
+        # 为了测试 UCI 输入，我们可以尝试一个已知的开局招法
+        # 假设红方先手 (current_player == 0)
+        if env.current_player == 0:
+            # 红方开局炮二平五 (c2->e2) 对应的 UCI 是 c3-e3 (从红方视角)
+            # 但是 UCI 坐标是固定的，与玩家无关，所以 c2 -> e2 对应的棋盘坐标是 (7, 1) -> (7, 4)
+            # 转换为 UCI 坐标 (列 0-8 -> a-i, 行 0-9 -> 10-1)
+            # (7, 1) -> 列 1 -> b, 行 7 -> 10-7=3 -> b3
+            # (7, 4) -> 列 4 -> e, 行 7 -> 10-7=3 -> e3
+            # 所以 UCI 招法是 b3e3
+            uci_action = "b3e3" 
+        else:
+            # 黑方开局马8进7 (h9->g7) 对应的 UCI 是 h10-g8
+            # 棋盘坐标 (0, 7) -> (2, 6)
+            # (0, 7) -> 列 7 -> h, 行 0 -> 10-0=10 -> h10
+            # (2, 6) -> 列 6 -> g, 行 2 -> 10-2=8 -> g8
+            # 所以 UCI 招法是 h10g8
+            uci_action = "h10g8"
+            
+        # 检查这个 UCI 招法是否合法，避免非法招法结束游戏
+        try:
+            from_row, from_col, to_row, to_col = env._parse_uci_move(uci_action)
+            is_legal = env._is_valid_move(from_row, from_col, to_row, to_col)
+            if is_legal:
+                 print(f"执行 UCI 招法: {uci_action}")
+                 obs, reward, done, info = env.step(uci_action) # 现在 step 方法可以接受 UCI 字符串
+            else:
+                 print(f"UCI 招法 {uci_action} 非法！")
+                 # 如果非法，可以选择一个合法动作或者结束游戏
+                 valid_actions, _ = env.get_valid_actions()
+                 if valid_actions:
+                      action = np.random.choice(valid_actions)
+                      print(f"执行随机合法动作: {action}")
+                      obs, reward, done, info = env.step(action)
+                 else:
+                      print("无合法动作，游戏结束。")
+                      done = True
+        except ValueError as e:
+            print(f"解析 UCI 招法出错: {e}")
+            done = True # 解析出错也结束游戏
+
+
+        # if "message" not in info: # 检查 info 字典中是否有 message 键
+        #     print(f"Player: {'Red' if env.current_player == 0 else 'Black'}, Reward: {reward}")
+        #     env.render()
+        #     pygame.time.wait(500)  # 暂停0.5秒
+        
+        # 简化测试，直接打印状态和奖励
+        print(f"Player: {'Red' if env.current_player == 0 else 'Black'}, Reward: {reward}")
+        env.render()
+        pygame.time.wait(500)  # 暂停0.5秒
+
+
     
     print("Game Over!")
     pygame.time.wait(3000)  # 游戏结束后等待3秒

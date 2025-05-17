@@ -27,11 +27,11 @@ class ChessNet(nn.Module):
         # 共享特征提取层
         self.shared = nn.Sequential(
             nn.Linear(self.flatten_size, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Mish(),
+            nn.Dropout(0.1),
             nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3)
+            nn.Mish(),
+            nn.Dropout(0.1)
         )
         
         # 策略头（actor）
@@ -86,9 +86,9 @@ class ChessNet(nn.Module):
             x = torch.cat((x, player_channel), dim=1)
         
         # 卷积层
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.mish(self.bn1(self.conv1(x)))
+        x = F.mish(self.bn2(self.conv2(x)))
+        x = F.mish(self.bn3(self.conv3(x)))
         
         # 展平
         x = x.view(-1, self.flatten_size)
@@ -139,7 +139,7 @@ class ChessPPO:
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
-        self.kl_target = 0.015 # 调整KL目标
+        self.kl_target = 0.02 # 调整KL目标
     
     def compute_gae(self, rewards, values, next_value, dones):
         """计算广义优势估计（GAE）"""
@@ -321,7 +321,7 @@ class ChessPPO:
         action_probs = action_probs * action_mask_tensor.squeeze(0)
 
         # 归一化概率分布（确保合法动作的概率之和为1）
-        action_probs = action_probs / (action_probs.sum() + 1e-9)
+        action_probs = action_probs / (action_probs.sum() + 1e-8)
 
         # 使用 Categorical 分布进行采样
         dist = Categorical(action_probs)
